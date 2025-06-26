@@ -1,5 +1,9 @@
+
+# risk_analysis.py
 import pandas as pd
 import numpy as np
+from indicators import Indicators
+from config import Config
 
 class RiskAnalyzer:
     @staticmethod
@@ -9,7 +13,11 @@ class RiskAnalyzer:
         analysis_date,
         years: int = 3
     ) -> dict:
-        # Başlangıç tarihini belirle ve slice üzerinden copy alın
+        """
+        Şirket ve piyasa verilerini kullanarak haftalık risk metriklerini hesaplar ve
+        piyasa durumunu (Bull/Bear) belirler.
+        """
+        # Zaman penceresini belirle (years yıl + 30 gün)
         start_date = analysis_date - pd.Timedelta(days=years * 365 + 30)
         comp = company_df.loc[start_date:analysis_date].copy()
         mkt  = market_df.loc[start_date:analysis_date].copy()
@@ -17,27 +25,29 @@ class RiskAnalyzer:
             return None
 
         # Haftalık getiri
-        weekly_close = comp['Close'].resample('W').last().pct_change().dropna()
+        weekly_ret = comp['Close'].resample('W').last().pct_change().dropna()
 
-        # Günlük getiri
+        # Günlük getirileri hesapla
         comp['Daily_Return'] = comp['Close'].pct_change()
         mkt['Daily_Return']  = mkt['Close'].pct_change()
-        comp = comp.dropna(subset=['Daily_Return','Volume'])
+        comp = comp.dropna(subset=['Daily_Return', 'Volume'])
         mkt  = mkt.dropna(subset=['Daily_Return'])
 
-        # Ortak tarihler
+        # Ortak günlük tarihler
         common_daily = comp.index.intersection(mkt.index)
-        comp_daily   = comp.loc[common_daily, 'Daily_Return']
-        mkt_daily    = mkt.loc[common_daily, 'Daily_Return']
+        if common_daily.empty:
+            return None
+        comp_daily = comp.loc[common_daily, 'Daily_Return']
+        mkt_daily  = mkt.loc[common_daily, 'Daily_Return']
 
-        # Haftalık ortak
-        mkt_weekly = mkt['Close'].resample('W').last().pct_change().dropna()
-        common_week = weekly_close.index.intersection(mkt_weekly.index)
+        # Haftalık ortak tarihler
+        mkt_weekly  = mkt['Close'].resample('W').last().pct_change().dropna()
+        common_week = weekly_ret.index.intersection(mkt_weekly.index)
         if len(common_week) < 2:
             return None
-        weekly_ret = weekly_close.loc[common_week]
+        weekly_ret = weekly_ret.loc[common_week]
 
-        # Metrikler
+        # Risk metrikleri
         exp_ret       = weekly_ret.mean()
         vol_week      = weekly_ret.std()
         last_week_vol = comp_daily.tail(5).std() * np.sqrt(5) if len(comp_daily) >= 5 else np.nan
@@ -48,29 +58,48 @@ class RiskAnalyzer:
         m4 = (close_ser.iloc[-1] - close_ser.iloc[-20]) / close_ser.iloc[-20] if len(close_ser) >= 20 else np.nan
 
         # Hacim değişimleri
-        weekly_vol = comp['Volume'].resample('W').mean().dropna()
-        h_changes  = [np.nan, np.nan, np.nan]
-        if len(weekly_vol) >= 4:
-            last4 = weekly_vol.iloc[-4:]
-            for i in range(3):
-                if last4.iloc[i] != 0:
-                    h_changes[i] = (last4.iloc[i+1] - last4.iloc[i]) / last4.iloc[i]
+        vol_series = comp.loc[common_daily, 'Volume']
+        weekly_avg_volumes = vol_series.resample('W').mean().dropna()
+        cw4_3 = cw3_2 = cw2_1 = np.nan
+        if len(weekly_avg_volumes) >= 4:
+            last4 = weekly_avg_volumes.iloc[-4:]
+            if last4.iloc[-2] != 0:
+                cw4_3 = (last4.iloc[-1] - last4.iloc[-2]) / last4.iloc[-2]
+            if last4.iloc[-3] != 0:
+                cw3_2 = (last4.iloc[-2] - last4.iloc[-3]) / last4.iloc[-3]
+            if last4.iloc[-4] != 0:
+                cw2_1 = (last4.iloc[-3] - last4.iloc[-4]) / last4.iloc[-4]
 
-        # Beta
-        cov  = comp_daily.cov(mkt_daily)
-        var  = mkt_daily.var()
-        beta = cov/var if var and not np.isnan(cov) else np.nan
+        # Beta hesaplama
+        cov = comp_daily.cov(mkt_daily)
+        var = mkt_daily.var()
+        beta = cov / var if var and not np.isnan(cov) else np.nan
+
+        # Piyasa durumunu belirle (Bull/Bear) mavilim ile
+        # analysis_date kapanış fiyatı
+        current_close = comp['Close'].iloc[-1]
+        mav_series = Indicators.calculate_mavilim(
+            company_df['Close'],
+            Config.MAVILIM_FMAL,
+            Config.MAVILIM_SMAL
+        )
+        try:
+            mav_val = mav_series.loc[analysis_date]
+        except KeyError:
+            mav_val = mav_series[:analysis_date].iloc[-1] if not mav_series.empty else np.nan
+        market_condition = 'Bull' if not np.isnan(mav_val) and current_close >= mav_val else 'Bear'
 
         return {
             "Şirket": None,
             "Beklenen Getiri": exp_ret,
             "Volatilite": vol_week,
             "Son 1 Haftalık Vol": last_week_vol,
-            "Volatilite Oranı": (last_week_vol/vol_week) if vol_week else np.nan,
+            "Volatilite Oranı": (last_week_vol / vol_week) if vol_week else np.nan,
             "Momentum 1w": m1,
             "Momentum 4w": m4,
-            "H4-H3 Hacim": h_changes[2],
-            "H3-H2 Hacim": h_changes[1],
-            "H2-H1 Hacim": h_changes[0],
-            "Beta": beta
+            "H4-H3 Hacim": cw4_3,
+            "H3-H2 Hacim": cw3_2,
+            "H2-H1 Hacim": cw2_1,
+            "Beta": beta,
+            "Piyasa Durumu": market_condition
         }
